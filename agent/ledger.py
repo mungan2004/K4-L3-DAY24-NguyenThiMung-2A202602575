@@ -1,48 +1,82 @@
 """BƯỚC 3d — audit ledger append-only, tamper-evident (10').
 
-JSONL, mỗi tool call một dòng. Đọc CHECKPOINTS.md (§3d).
-
-Interface bắt buộc (tests/test_ledger.py và agent/runner.py gọi trực tiếp):
-
-    append(entry: dict, path: pathlib.Path) -> dict
-        `entry` phải có tối thiểu các field:
-            ts, agent_id, run_id, tool, args_hash, classification,
-            decision, reason
-        Hàm tự thêm 2 field:
-            prev_hash  = hash của dòng ngay trước trong file này, hoặc
-                         "0" * 64 nếu là dòng đầu tiên
-            hash       = sha256 tính từ nội dung dòng NÀY (bao gồm cả
-                         prev_hash, KHÔNG bao gồm field hash) — dùng
-                         json.dumps(..., sort_keys=True) trước khi hash
-                         để thứ tự field không ảnh hưởng kết quả.
-        Append 1 dòng JSON (utf-8, ensure_ascii=False) vào cuối `path`,
-        tạo file/thư mục cha nếu chưa có. Trả về dict đầy đủ đã ghi
-        (bao gồm prev_hash/hash).
-
-    verify(path: pathlib.Path) -> bool
-        Đọc toàn bộ file, trả về True nếu TẤT CẢ đều đúng:
-          - mọi dòng có `reason` non-empty
-          - prev_hash của dòng n == hash đã lưu của dòng n-1 (dòng đầu so
-            với "0" * 64)
-          - hash lưu trong dòng n khớp lại khi tính lại từ nội dung dòng đó
-        Trả về False nếu một dòng còn trong file bị sửa mà không tính lại
-        hash, nếu xoá/chèn giữa file làm đứt liên kết, hoặc thiếu reason.
-        Chỉ kiểm tra file hiện có KHÔNG phát hiện được việc xoá dòng cuối
-        hoặc viết lại cả file và tính lại chuỗi. Muốn phát hiện cắt đuôi
-        phải lưu hash/số dòng cuối ở một nơi tin cậy bên ngoài file rồi
-        đối chiếu. Bài lab không cung cấp mốc đó.
-
-Sinh viên phải tự tay chứng minh được: sửa 1 ký tự trong 1 dòng giữa file
-rồi gọi verify() phải trả về False.
+JSONL, mỗi tool call một dòng với sha256 hash chain.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    """Ghi 1 dòng vào ledger có hash chain tamper-evident.
+    Tự động thêm `prev_hash` và `hash`.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    prev_hash = "0" * 64
+    if path.exists():
+        content = path.read_text(encoding="utf-8").strip()
+        if content:
+            last_line = content.splitlines()[-1]
+            last_entry = json.loads(last_line)
+            prev_hash = last_entry["hash"]
+
+    full_entry = dict(entry)
+    full_entry["prev_hash"] = prev_hash
+
+    # Hash tính từ nội dung entry bao gồm prev_hash, không bao gồm trường hash
+    data_to_hash = json.dumps(full_entry, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    entry_hash = hashlib.sha256(data_to_hash).hexdigest()
+    full_entry["hash"] = entry_hash
+
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(full_entry, ensure_ascii=False) + "\n")
+
+    return full_entry
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    """Xác thực toàn bộ chuỗi ledger:
+    - Mọi entry có reason không rỗng
+    - prev_hash khớp với hash của dòng trước đó (dòng đầu là '0' * 64)
+    - hash của mỗi dòng khớp khi tính lại
+    """
+    path = Path(path)
+    if not path.exists():
+        return False
+
+    lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not lines:
+        return False
+
+    expected_prev = "0" * 64
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except Exception:
+            return False
+
+        reason = entry.get("reason")
+        if not reason or not str(reason).strip():
+            return False
+
+        if entry.get("prev_hash") != expected_prev:
+            return False
+
+        stored_hash = entry.get("hash")
+        if not stored_hash:
+            return False
+
+        entry_without_hash = {k: v for k, v in entry.items() if k != "hash"}
+        data_to_hash = json.dumps(entry_without_hash, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        calculated_hash = hashlib.sha256(data_to_hash).hexdigest()
+
+        if calculated_hash != stored_hash:
+            return False
+
+        expected_prev = stored_hash
+
+    return True
